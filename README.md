@@ -12,7 +12,7 @@ This repo contains two parts:
 
 2) **Streamlit app** demonstrating an interesting statistical property: the **Central Limit Theorem** and when it **fails** (Cauchy, infinite variance).  
    - App file: `streamlit_app.py`  
-   - Live demo (after you deploy): _add your Streamlit URL here_
+   - ##Live Demo - https://top-vs-revenue-and-clt-demo-hpfdhpyxypjoxmnxxjuryw.streamlit.app/
 
 ---
 
@@ -21,4 +21,4 @@ This repo contains two parts:
 pip install -r requirements.txt
 python analyze.py --csv "YOUR_DATA.csv" --time-col "top" --revenue-col "revenue" --controls "browser,platform,site"
 
-##Live Demo - https://top-vs-revenue-and-clt-demo-hpfdhpyxypjoxmnxxjuryw.streamlit.app/
+
