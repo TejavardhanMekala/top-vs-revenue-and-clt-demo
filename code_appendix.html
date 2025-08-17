@@ -1,0 +1,403 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'><title>Code Appendix</title></head><body><h1>Code Appendix: analyze.py</h1><pre style='white-space:pre-wrap;'>#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Analyze relationship between time on page (TOP) and revenue.
+- Accepts a CSV and column names.
+- Produces a short, human-friendly PDF report (no raw stat dumps) and a code appendix (HTML).
+- Robust to missing/extra variables; attempts column inference if not provided.
+- Includes simple correlations, univariate fit, adjusted (multivariate) fit, and easy-to-read visuals.
+"""
+import argparse
+import os
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Stats
+try:
+    import statsmodels.api as sm
+    import statsmodels.formula.api as smf
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+    HAVE_SM = True
+except Exception:
+    HAVE_SM = False
+
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+
+def infer_columns(df, time_col=None, revenue_col=None):
+    cols = {c.lower(): c for c in df.columns}
+    # heuristic candidates
+    time_cands = [c for c in df.columns if re.search(r'(time|duration|sec|min|top)', c, re.I)]
+    rev_cands  = [c for c in df.columns if re.search(r'(rev|revenue|sales|amount|gmv)', c, re.I)]
+    t = time_col or (time_cands[0] if time_cands else None)
+    r = revenue_col or (rev_cands[0] if rev_cands else None)
+    return t, r
+
+def standardize(s):
+    s = s.astype(float)
+    std = s.std(ddof=0)
+    if std == 0 or np.isnan(std):
+        return s*0.0, 0.0, s.mean()
+    return (s - s.mean())/std, std, s.mean()
+
+def safe_spearman(x, y):
+    try:
+        from scipy.stats import spearmanr
+        rho, p = spearmanr(x, y, nan_policy='omit')
+        return float(rho), float(p)
+    except Exception:
+        # fallback: manual rank correlation (no p-value)
+        xr = pd.Series(x).rank()
+        yr = pd.Series(y).rank()
+        return float(np.corrcoef(xr, yr)[0,1]), np.nan
+
+def summarize_model_coef(result, var_name):
+    """Return (coef, se, pval, conf_int_low, conf_int_high) for var_name, or Nones if missing."""
+    if result is None:
+        return None
+    try:
+        if hasattr(result, "params") and var_name in result.params.index:
+            coef = result.params[var_name]
+            se = result.bse[var_name] if hasattr(result, "bse") else np.nan
+            pval = result.pvalues[var_name] if hasattr(result, "pvalues") else np.nan
+            ci = result.conf_int().loc[var_name].tolist() if hasattr(result, "conf_int") else [np.nan, np.nan]
+            return float(coef), float(se), float(pval), float(ci[0]), float(ci[1])
+    except Exception:
+        pass
+    return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv", required=True, help="Path to CSV")
+    parser.add_argument("--time-col", default=None, help="Column name for time on page (TOP)")
+    parser.add_argument("--revenue-col", default=None, help="Column name for revenue")
+    parser.add_argument("--controls", default=None, help="Comma-separated list of control columns")
+    parser.add_argument("--outdir", default="outputs", help="Output directory")
+    args = parser.parse_args()
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(args.csv)
+    tcol, rcol = infer_columns(df, args.time_col, args.revenue_col)
+    if tcol is None or rcol is None:
+        raise ValueError("Could not infer time or revenue columns. Provide --time-col and --revenue-col.")
+
+    # Drop rows missing key vars
+    work = df[[tcol, rcol]].copy()
+    # Gather potential controls
+    if args.controls:
+        control_list = [c.strip() for c in args.controls.split(",") if c.strip() in df.columns]
+    else:
+        # default: all other columns except target/time, drop high-cardinality text-ish cols
+        control_list = [c for c in df.columns if c not in [tcol, rcol]]
+        # prune controls that are too unique/ID-like
+        pruned = []
+        for c in control_list:
+            nunique = df[c].nunique(dropna=True)
+            if nunique &lt;= 1: 
+                continue
+            if pd.api.types.is_numeric_dtype(df[c]):
+                pruned.append(c)
+            else:
+                # keep categorical with reasonable cardinality
+                if nunique &lt;= 30:
+                    pruned.append(c)
+        control_list = pruned
+
+    # Clean numeric conversion for key vars
+    for c in [tcol, rcol]:
+        if not pd.api.types.is_numeric_dtype(work[c]):
+            work[c] = pd.to_numeric(work[c], errors="coerce")
+    work = work.join(df[control_list], how="left")
+    work = work.dropna(subset=[tcol, rcol]).copy()
+
+    # Basic stats
+    x = work[tcol].astype(float)
+    y = work[rcol].astype(float)
+    pearson = float(np.corrcoef(x, y)[0,1]) if len(work) &gt; 1 else np.nan
+    rho, rho_p = safe_spearman(x, y)
+
+    # Univariate linear model y ~ x
+    uni = None
+    uni_std = None
+    pred_line = None
+    if HAVE_SM and len(work) &gt;= 3:
+        uni = sm.OLS(y, sm.add_constant(x)).fit(cov_type="HC3")
+        # Standardized model
+        zx, _, _ = standardize(x)
+        zy, _, _ = standardize(y)
+        uni_std = sm.OLS(zy, sm.add_constant(zx)).fit(cov_type="HC3")
+        # Prediction line
+        xs = np.linspace(x.min(), x.max(), 100)
+        pred_line = pd.DataFrame({tcol: xs})
+        pred_line["const"] = 1.0
+        preds = uni.get_prediction(pred_line[["const", tcol]]).summary_frame(alpha=0.05)
+        pred_line["mean"] = preds["mean"]
+        pred_line["ci_low"] = preds["obs_ci_lower"]
+        pred_line["ci_high"] = preds["obs_ci_upper"]
+
+    # Adjusted model: y ~ x + controls
+    adj = None
+    adj_std = None
+    adj_controls = []
+    if HAVE_SM and len(work) &gt;= 10 and control_list:
+        # Build formula; auto-encode categoricals with C()
+        terms = []
+        std_terms = []
+        for c in control_list:
+            if pd.api.types.is_numeric_dtype(work[c]):
+                terms.append(f"Q(\"{c}\")")
+                std_terms.append(f"Q(\"z_{c}\")")
+                # create standardized versions
+                z, _, _ = standardize(work[c].astype(float))
+                work[f"z_{c}"] = z
+            else:
+                terms.append(f"C(Q(\"{c}\"))")
+                std_terms.append(f"C(Q(\"{c}\"))")
+        # raw
+        formula = f"Q(\"{rcol}\") ~ Q(\"{tcol}\") + " + " + ".join(terms) if terms else f"Q(\"{rcol}\") ~ Q(\"{tcol}\")"
+        # standardized x and y (note: keep categoricals as-is; standardize numeric controls)
+        zt, _, _ = standardize(work[tcol])
+        zy, _, _ = standardize(work[rcol])
+        work["_z_x_"] = zt
+        work["_z_y_"] = zy
+        std_formula = f"Q(\"_z_y_\") ~ Q(\"_z_x_\") + " + " + ".join(std_terms) if std_terms else f"Q(\"_z_y_\") ~ Q(\"_z_x_\")"
+        try:
+            print("ADJ FORMULA:", formula)
+            print("STD FORMULA:", std_formula)
+            adj = smf.ols(formula, data=work).fit(cov_type="HC3")
+            adj_std = smf.ols(std_formula, data=work).fit(cov_type="HC3")
+            adj_controls = control_list
+        except Exception as e:
+            print("Adjusted model error:", e)
+            adj = None
+            adj_std = None
+            adj_controls = []
+
+    # LOWESS curve for visualization
+    lowess_xy = None
+    if HAVE_SM and len(work) &gt;= 10:
+        try:
+            lo = lowess(y, x, frac=0.3, it=0, return_sorted=True)
+            lowess_xy = np.array(lo)
+        except Exception:
+            lowess_xy = None
+
+    # Create plots
+    img_paths = []
+    plt.figure(figsize=(6,4))
+    plt.scatter(x, y, alpha=0.6)
+    if pred_line is not None:
+        plt.plot(np.asarray(pred_line[tcol], dtype=float), np.asarray(pred_line["mean"], dtype=float), lw=2)
+        plt.fill_between(np.asarray(pred_line[tcol], dtype=float), np.asarray(pred_line["ci_low"], dtype=float), np.asarray(pred_line["ci_high"], dtype=float), alpha=0.2)
+    if lowess_xy is not None:
+        plt.plot(lowess_xy[:,0], lowess_xy[:,1], lw=2, linestyle="--")
+    plt.xlabel(tcol)
+    plt.ylabel(rcol)
+    plt.title("Revenue vs. Time on Page")
+    p1 = str(outdir / "fig_scatter_fit.png")
+    plt.tight_layout()
+    plt.savefig(p1, dpi=200)
+    plt.close()
+    img_paths.append(p1)
+
+    # Adjusted effect plot: predicted y across x with controls held at observed mix (via partial regression)
+    if HAVE_SM and adj is not None:
+        xgrid = np.linspace(x.min(), x.max(), 100)
+        # Build dataframe for prediction using typical values for controls
+        pred_df = pd.DataFrame({tcol: xgrid})
+        # For categoricals: use the most frequent level
+        for c in adj_controls:
+            if pd.api.types.is_numeric_dtype(work[c]):
+                pred_df[c] = work[c].median()
+            else:
+                pred_df[c] = work[c].mode().iloc[0]
+        pred_df = sm.add_constant(pred_df, has_constant='add')
+        pr = adj.get_prediction(pred_df).summary_frame(alpha=0.05)
+        plt.figure(figsize=(6,4))
+        plt.plot(xgrid, np.asarray(pr["mean"], dtype=float), lw=2)
+        plt.fill_between(xgrid, np.asarray(pr["mean_ci_lower"], dtype=float), np.asarray(pr["mean_ci_upper"], dtype=float), alpha=0.2)
+        plt.xlabel(tcol)
+        plt.ylabel(rcol)
+        plt.title("Adjusted Relationship: Revenue vs. Time on Page")
+        p2 = str(outdir / "fig_adjusted.png")
+        plt.tight_layout()
+        plt.savefig(p2, dpi=200)
+        plt.close()
+        img_paths.append(p2)
+
+    # Residuals plot for univariate model (diagnostic, simple visual)
+    if HAVE_SM and uni is not None:
+        resid = uni.resid
+        plt.figure(figsize=(6,4))
+        plt.scatter(uni.fittedvalues, resid, alpha=0.6)
+        plt.axhline(0, linestyle="--")
+        plt.xlabel("Fitted revenue (univariate)")
+        plt.ylabel("Residuals")
+        plt.title("Residuals vs Fitted")
+        p3 = str(outdir / "fig_residuals.png")
+        plt.tight_layout()
+        plt.savefig(p3, dpi=200)
+        plt.close()
+        img_paths.append(p3)
+
+    # Gather key numbers for narration
+    uni_stats = summarize_model_coef(uni, tcol) if uni is not None else None
+    uni_std_stats = summarize_model_coef(uni_std, "_z_x_") if uni_std is not None else None  # may be None because name differs
+    # If standardized univariate used different var name
+    if uni_std_stats is None and uni_std is not None:
+        # try to infer by excluding const
+        candidates = [k for k in uni_std.params.index if k != "const"]
+        if candidates:
+            uni_std_stats = summarize_model_coef(uni_std, candidates[0])
+
+    adj_stats = summarize_model_coef(adj, tcol) if adj is not None else None
+    # find standardized var in adj_std
+    if adj_std is not None:
+        std_name = "_z_x_"
+        if std_name not in getattr(adj_std, "params", {}).index:
+            # fallback: first non-const param
+            cands = [k for k in adj_std.params.index if k != "Intercept" and k != "const"]
+            std_name = cands[0] if cands else None
+        adj_std_stats = summarize_model_coef(adj_std, std_name) if std_name else None
+    else:
+        adj_std_stats = None
+
+    # Build PDF
+    report_path = outdir / "Report.pdf"
+    styles = getSampleStyleSheet()
+    story = []
+    title = Paragraph("&lt;b&gt;Time on Page vs Revenue: Brief Report&lt;/b&gt;", styles["Title"])
+    story.append(title)
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(f"Dataset size used: {len(work):,} rows.", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    bullets = []
+    # 1) Simple association
+    bullets.append(f"Simple association: Pearson r = {pearson:.3f}; Spearman ρ = {rho:.3f}{'' if np.isnan(rho_p) else f' (p={rho_p:.3g})'}.")
+    # 2) Univariate slope
+    if uni_stats is not None:
+        coef, se, pval, lo, hi = uni_stats
+        bullets.append(f"Univariate fit (revenue ~ time): slope = {coef:.3g} (SE {se:.3g}, 95% CI [{lo:.3g}, {hi:.3g}], p={pval:.3g}).")
+    if uni_std_stats is not None:
+        scoef, sse, sp, slo, shi = uni_std_stats
+        bullets.append(f"Standardized effect (both variables z-scored): β = {scoef:.3g} (p={sp:.3g}).")
+    # 3) Adjusted slope
+    if adj_stats is not None:
+        coef, se, pval, lo, hi = adj_stats
+        bullets.append(f"Adjusted for other variables: slope = {coef:.3g} (SE {se:.3g}, 95% CI [{lo:.3g}, {hi:.3g}], p={pval:.3g}).")
+    if adj_std_stats is not None:
+        scoef, sse, sp, slo, shi = adj_std_stats
+        bullets.append(f"Adjusted standardized effect: β = {scoef:.3g} (p={sp:.3g}).")
+
+    # Key takeaway language
+    takeaway_txt = "In plain language: "
+    if uni_stats is None:
+        takeaway_txt += "We observe the direction and strength using correlations. "
+    else:
+        if adj_stats is None:
+            takeaway_txt += "Time on page has a measurable association with revenue, even without controlling for other factors. "
+        else:
+            # compare univariate vs adjusted
+            ucoef = uni_stats[0]
+            acoef = adj_stats[0]
+            change = (acoef - ucoef)
+            direction = "stronger" if abs(acoef) &gt; abs(ucoef) else "weaker"
+            takeaway_txt += f"After controlling for other variables, the time effect becomes {direction} (Δ slope ≈ {change:.3g}). "
+
+    story.append(Paragraph("&lt;b&gt;Key Findings&lt;/b&gt;", styles["Heading2"]))
+    for b in bullets:
+        story.append(Paragraph(f"• {b}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    # Visuals with captions
+    story.append(Paragraph("&lt;b&gt;Visuals&lt;/b&gt;", styles["Heading2"]))
+    cap1 = "Revenue vs. Time on Page. Line shows fitted relationship; shaded region is a 95% interval. Dashes show a smoothing curve to reveal nonlinearity."
+    story.append(Paragraph(cap1, styles["Italic"]))
+    story.append(Spacer(1, 6))
+    story.append(Image(str(p1), width=480, height=320))
+    story.append(Spacer(1, 12))
+
+    if HAVE_SM and adj is not None:
+        story.append(Paragraph("Adjusted relationship (holding other variables at typical values).", styles["Italic"]))
+        story.append(Spacer(1, 6))
+        story.append(Image(str(p2), width=480, height=320))
+        story.append(Spacer(1, 12))
+
+    if HAVE_SM and uni is not None:
+        story.append(Paragraph("Residuals vs. Fitted (diagnostic for simple model).", styles["Italic"]))
+        story.append(Spacer(1, 6))
+        story.append(Image(str(p3), width=480, height=320))
+        story.append(Spacer(1, 12))
+
+    # Brief methodology, no raw dumps
+    story.append(Paragraph("&lt;b&gt;Method (Brief)&lt;/b&gt;", styles["Heading2"]))
+    method_txt = (
+        "We assessed correlation (Pearson and Spearman) and fit simple and adjusted linear models. "
+        "Adjusted models include numeric controls as-is and encode low-cardinality categoricals. "
+        "Uncertainty uses robust (HC3) standard errors. We visualize both unadjusted and adjusted relationships. "
+        "To make units irrelevant, we also report standardized effects (β) using z-scores."
+    )
+    story.append(Paragraph(method_txt, styles["Normal"]))
+
+    doc = SimpleDocTemplate(str(report_path), pagesize=letter)
+    doc.build(story)
+
+    # Write code appendix (HTML) by embedding this source file
+    code_html_path = outdir / "code_appendix.html"
+    try:
+        with open(__file__, "r", encoding="utf-8") as f:
+            src = f.read()
+    except Exception:
+        src = "# Source unavailable at runtime."
+    with open(code_html_path, "w", encoding="utf-8") as f:
+        f.write("&lt;!DOCTYPE html&gt;&lt;html&gt;&lt;head&gt;&lt;meta charset='utf-8'&gt;&lt;title&gt;Code Appendix&lt;/title&gt;&lt;/head&gt;&lt;body&gt;")
+        f.write("&lt;h1&gt;Code Appendix: analyze.py&lt;/h1&gt;&lt;pre style='white-space:pre-wrap;'&gt;")
+        f.write(src.replace("&amp;","&amp;amp;").replace("&lt;","&amp;lt;").replace("&gt;","&amp;gt;"))
+        f.write("&lt;/pre&gt;&lt;/body&gt;&lt;/html&gt;")
+
+    # Also write a tiny README explaining how to run
+    readme_path = outdir / "README_ANALYSIS.md"
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(f"""# How to run the analysis
+
+## Quick start
+```bash
+python analyze.py --csv YOUR_DATA.csv --time-col "{tcol}" --revenue-col "{rcol}"
+```
+
+Optionally add explicit controls:
+```bash
+python analyze.py --csv YOUR_DATA.csv --time-col "{tcol}" --revenue-col "{rcol}" --controls "channel,device,region"
+```
+
+Outputs appear in `{outdir.resolve()}`:
+- `Report.pdf` — brief, readable report with visuals (no raw stat dumps)
+- `code_appendix.html` — the analysis code (easy to open)
+- `fig_scatter_fit.png`, `fig_adjusted.png`, `fig_residuals.png` — images used in the report
+
+## Notes
+- If `statsmodels` is available, robust standard errors (HC3) are used.
+- Categorical controls are auto-encoded when they have ≤ 30 levels.
+- Standardized effects (β) are reported so units don't matter.
+""")
+
+    print(f"Report written to: {report_path}")
+    print(f"Code appendix: {code_html_path}")
+    print(f"Figures: {img_paths}")
+    print(f"Detected time column: {tcol} | revenue column: {rcol}")
+    if adj_controls:
+        print(f"Used controls: {adj_controls}")
+    else:
+        print("No controls used or available.")
+    
+if __name__ == "__main__":
+    main()
+</pre></body></html>
