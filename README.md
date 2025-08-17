@@ -20,3 +20,5 @@ This repo contains two parts:
 ```bash
 pip install -r requirements.txt
 python analyze.py --csv "YOUR_DATA.csv" --time-col "top" --revenue-col "revenue" --controls "browser,platform,site"
+
+##Live Demo - https://top-vs-revenue-and-clt-demo-hpfdhpyxypjoxmnxxjuryw.streamlit.app/
